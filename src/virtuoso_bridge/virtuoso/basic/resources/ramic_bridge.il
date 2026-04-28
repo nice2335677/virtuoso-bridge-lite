@@ -31,6 +31,12 @@ unless(boundp('RBIpc) RBIpc = 'unbound)
 ; Ring buffer for daemon stderr; flushed to CIW only on non-zero exit.
 unless(boundp('RBStderrBuf) RBStderrBuf = "")
 
+; Last known daemon OS pid + bind address.  Captured at RBStart and reused
+; by Finish/Stop/Refresh so post-mortem messages can show port/pid even
+; after the IPC handle has been freed.
+unless(boundp('RBLastPid) RBLastPid = nil)
+unless(boundp('RBLastBind) RBLastBind = "")
+
 procedure(RBIpcDataHandler(ipcId data)
   ; Handler for successful data received from the Python daemon.
   ; Code is executed via evalstring(), which bypasses CIW's interactive loop.
@@ -64,7 +70,8 @@ procedure(RBIpcFinishHandler(ipcId data)
   ; Handler called when the Python daemon process exits
   let((exitStatus)
 	exitStatus = ipcGetExitStatus(ipcId)
-    printf("[RAMIC Bridge (%L)] exit at (%s) with state = %L\n" ipcId getCurrentTime() exitStatus)
+    printf("[RAMIC Bridge ipc=%L pid=%L port=%d] exit at (%s) state=%L\n"
+        ipcId RBLastPid RBPort getCurrentTime() exitStatus)
     when(exitStatus != 0 && strlen(RBStderrBuf) > 0
         printf("[RAMIC Bridge stderr]\n%s\n" RBStderrBuf))
     RBStderrBuf = ""
@@ -75,7 +82,8 @@ procedure(RBStart()
     ; Start the RAMIC Bridge daemon process
     ; This launches the Python daemon as a child process of Virtuoso
 	if(boundp('RBIpc) && ipcIsAliveProcess(RBIpc) then
-		printf("[RAMIC Bridge (%L)] is already running\n", RBIpc)
+		printf("[RAMIC Bridge ipc=%L pid=%L port=%d] already running\n"
+			RBIpc RBLastPid RBPort)
 	else
 		prog((host logpath)
 			; Determine host binding based on RBLocal setting
@@ -95,37 +103,55 @@ procedure(RBStart()
 			; so the system Python links against its own libs, not Virtuoso's
 			; bundled (and often incompatible) copies.
 			RBIpc = ipcBeginProcess(sprintf(nil "/usr/bin/env -u LD_LIBRARY_PATH -u LD_PRELOAD stdbuf -oL %s -u %L %L %L" RBPython RBDPath host RBPort) "" 'RBIpcDataHandler 'RBIpcErrHandler 'RBIpcFinishHandler logpath)
+			; Cache pid/bind so Refresh/Finish can still display them after
+			; the IPC handle is gone.  ipcGetPid returns the OS pid of the
+			; spawned child.
+			RBLastPid = errset(ipcGetPid(RBIpc)) && car(errset.errset)
+			RBLastBind = sprintf(nil "%s:%d" host RBPort)
 		)
-		printf("[RAMIC Bridge (%L)] start at (%s)\n" RBIpc getCurrentTime())
+		printf("[RAMIC Bridge ipc=%L pid=%L] started: bind=%s log=%s at (%s)\n"
+			RBIpc RBLastPid RBLastBind
+			(if(RBDLog "/tmp/RB.log" "off"))
+			getCurrentTime())
 	)
 )
 
 procedure(RBStop()
     ; Stop the RAMIC Bridge daemon process
 	if(boundp('RBIpc) && ipcIsAliveProcess(RBIpc) then
+		printf("[RAMIC Bridge ipc=%L pid=%L port=%d] stopping\n"
+			RBIpc RBLastPid RBPort)
 		ipcKillProcess(RBIpc)
 	else
-		printf("[RAMIC Bridge] is already down\n" )
+		printf("[RAMIC Bridge] already down\n")
 	)
 )
 
 procedure(RBStopAll()
-    ; Emergency function to kill all RAMIC Bridge daemon processes
+    ; Emergency function to kill **the current user's** RAMIC Bridge
+    ; daemon processes only.  Earlier versions used ``pgrep -f`` without
+    ; ``-u``, which scanned every UID on the host and tried to kill
+    ; other users' daemons -- yielding "permission denied" noise and
+    ; (worst case) terminating an unrelated user's bridge if both ran
+    ; under the same account.
+    ;
     ; 1. Release Virtuoso's IPC bookkeeping for the live handle (if any)
-    ; 2. Match daemon by script filename (ramic_bridge_daemon_[23]),
-    ;    not by interpreter name -- works with pypy, conda pythons, etc.
-    ; 3. SIGTERM, wait 2s, then SIGKILL holdouts
-    ; 4. Free the port: fuser if available, otherwise surface the holder
-    ;    via ss/lsof so the user can see what to kill
-    ; 5. Reset Skill-side IPC state and stderr buffer
+    ; 2. Match daemon processes belonging to ``$USER`` only, by script
+    ;    filename (ramic_bridge_daemon_[23]).
+    ; 3. SIGTERM, wait 2s, then SIGKILL holdouts.
+    ; 4. Free the port: fuser only kills sockets the caller owns; ss/lsof
+    ;    fallbacks just *show* the holder.
+    ; 5. Reset Skill-side IPC state and stderr buffer.
     if(boundp('RBIpc) && RBIpc != 'unbound then
         errset(ipcKillProcess(RBIpc)))
     sh(sprintf(nil
-        "pgrep -f 'ramic_bridge_daemon_[23]' | xargs -r kill; sleep 2; pgrep -f 'ramic_bridge_daemon_[23]' | xargs -r kill -9; if command -v fuser >/dev/null 2>&1; then fuser -k %d/tcp 2>/dev/null; elif command -v ss >/dev/null 2>&1; then ss -tlnp 2>/dev/null | awk -v p=%d '$4 ~ \":\"p\"$\"' >&2; elif command -v lsof >/dev/null 2>&1; then lsof -iTCP:%d -sTCP:LISTEN >&2; fi"
-        RBPort RBPort RBPort))
+        "echo \"[RAMIC StopAll] user=$USER scope=own-uid port=%d\" >&2; pids=$(pgrep -u \"$USER\" -f 'ramic_bridge_daemon_[23]'); if [ -n \"$pids\" ]; then echo \"[RAMIC StopAll] killing pids: $pids\" >&2; echo \"$pids\" | xargs -r kill; sleep 2; pids2=$(pgrep -u \"$USER\" -f 'ramic_bridge_daemon_[23]'); [ -n \"$pids2\" ] && echo \"$pids2\" | xargs -r kill -9; else echo \"[RAMIC StopAll] no own daemon processes\" >&2; fi; if command -v fuser >/dev/null 2>&1; then fuser -k %d/tcp 2>/dev/null; elif command -v ss >/dev/null 2>&1; then ss -tlnp 2>/dev/null | awk -v p=%d '$4 ~ \":\"p\"$\"' >&2; elif command -v lsof >/dev/null 2>&1; then lsof -iTCP:%d -sTCP:LISTEN >&2; fi"
+        RBPort RBPort RBPort RBPort))
     RBIpc = 'unbound
+    RBLastPid = nil
     RBStderrBuf = ""
-    printf("[RAMIC Bridge] RBStopAll: kill issued; verify with: ss -tlnp | grep %d (or lsof -iTCP:%d)\n" RBPort RBPort)
+    printf("[RAMIC Bridge] RBStopAll: killed own daemons (UID-scoped, port=%d); verify: ss -tlnp | grep %d\n"
+        RBPort RBPort)
 )
 
 ; ============================================================================
@@ -135,17 +161,21 @@ procedure(RBStopAll()
 ; conflicts; build GUI and banner menu only the first time.
 unless(boundp('RBMonInstalled)
 progn(
-; Status label showing current bridge state
+; Status label showing current bridge state.  RBMRefresh() rewrites this
+; with live ipc / pid / bind info so the GUI tells you what's actually
+; serving — instead of just "Running" with no context.
 RBMState = hiCreateLabel(
 	?name 		'RBMState
-	?labelText 	"RAMIC Bridge State: ?"
+	?labelText 	"RAMIC Bridge: (press Refresh status)"
 	?justification CDS_JUSTIFY_LEFT
 )
 
-; Refresh button to update status display
+; Refresh button — only re-reads the SKILL state (RBIpc / RBPort /
+; RBLocal / RBEcho / RBDLog / pid) and repaints this form.  It does not
+; restart the daemon and does not re-read /tmp socket state.
 RBMBtnRefresh = hiCreateButton(
 	?name		'RBMBtnRefresh
-	?buttonText	"Refresh"
+	?buttonText	"Refresh status"
 	?callback	"RBMRefresh()"
 )
 
@@ -199,33 +229,39 @@ RBMBolLog = hiCreateBooleanButton(
 	?callback	nil
 )
 
-; Emergency kill all daemons button
+; Emergency kill button — UID-scoped (only kills this user's daemons).
+; Earlier "KILL ALL" was misleading: it tried to kill every user's
+; daemon on the host and got "permission denied" on others.
 RBMBtnStopAll = hiCreateButton(
 	?name		'RBMBtnStopAll
-	?buttonText	"KILL ALL DAEMON (USE AS BACKUP ONLY)"
+	?buttonText	"Kill MY daemons (force, UID-scoped)"
 	?callback	"RBStopAll() RBMRefresh()"
 )
 
-; Create the main monitor form
+; Create the main monitor form.  Note: form geometry is fixed at the
+; first ``hiCreateAppForm`` call in this Virtuoso session — re-loading
+; ramic_bridge.il only redefines the procedures (RBMRefresh / RBStart /
+; RBStopAll), it does NOT resize the existing form.  To pick up new
+; geometry, restart Virtuoso (or unbind RBMonInstalled and reload).
 hiCreateAppForm(
 	?name 'RBMonitor
 	?formTitle "RAMIC Bridge Monitor"
 	?fields list(
-		list(RBMState		20:10	300:30)    ; Status label
-		list(RBMBtnRefresh 	20:50 	100:30)    ; Refresh button
-		list(RBMBtnStart  	150:50 	100:30)    ; Start button
-		list(RBMBtnStop  	280:50 	100:30)    ; Stop button
-		list(RBMIntPort		20:90	170:30 	30)  ; Port input
-		list(RBMBolLocal	20:130	170:30)     ; Local-only checkbox
-		list(RBMBolEcho		20:170	170:30)     ; Echo checkbox
-		list(RBMBolLog		20:210	170:30)     ; Log checkbox
-		list(RBMBtnStopAll 	20:250 	360:30)     ; Emergency stop button
+		list(RBMState		20:10	600:30)     ; Status label (wide for ipc/pid/bind line)
+		list(RBMBtnRefresh 	20:50 	130:30)     ; Refresh button
+		list(RBMBtnStart  	170:50 	100:30)     ; Start button
+		list(RBMBtnStop  	290:50 	100:30)     ; Stop button
+		list(RBMIntPort		20:90	170:30 	30) ; Port input
+		list(RBMBolLocal	20:130	250:30)     ; Local-only checkbox
+		list(RBMBolEcho		20:170	250:30)     ; Echo checkbox
+		list(RBMBolLog		20:210	250:30)     ; Log checkbox
+		list(RBMBtnStopAll 	20:250 	370:30)     ; Emergency stop button
 	)
 	?buttonLayout	'OKCancelApply
 	?help			""
-	?initialSize		400:320
-	?minSize			400:320
-	?maxSize			400:320
+	?initialSize		640:320
+	?minSize			640:320
+	?maxSize			640:320
 	?mapCB			"RBMRefresh()"
 	?callback 		"RBMApply()"
 )
@@ -259,12 +295,31 @@ RBMonInstalled = t
 ) ; end unless(boundp 'RBMonInstalled) + progn
 
 procedure(RBMRefresh()
-    ; Refresh the monitor display with current status and settings
+    ; Re-read SKILL state and repaint the monitor form.
+    ; - State label gets ipc handle + os pid + bind:port so debugging
+    ;   doesn't require a separate `ss -tlnp` round-trip.
+    ; - Other widgets just mirror the current SKILL globals.
 	when(boundp('RBMonInstalled)
 	if(boundp('RBIpc) && ipcIsAliveProcess(RBIpc) then
-		RBMonitor->RBMState->value = sprintf(nil "RAMIC Bridge State: Running (%L)" RBIpc)
+		prog((bind)
+			; Re-derive bind from current settings (in case RBLocal toggled
+			; without a daemon restart).  RBLastBind is the bind captured
+			; at start; prefer it because it reflects what the daemon
+			; *actually* listens on.
+			bind = if(RBLastBind && strlen(RBLastBind) > 0
+				RBLastBind
+				sprintf(nil "%s:%d"
+					(if(RBLocal "127.0.0.1" "0.0.0.0"))
+					RBPort))
+			RBMonitor->RBMState->value = sprintf(nil
+				"RAMIC Bridge: Running   ipc=%L  pid=%L  bind=%s"
+				RBIpc RBLastPid bind)
+		)
 	else
-		RBMonitor->RBMState->value = "RAMIC Bridge State: Down"
+		RBMonitor->RBMState->value = if(RBLastPid
+			sprintf(nil "RAMIC Bridge: Down   (last pid=%L port=%d)"
+				RBLastPid RBPort)
+			"RAMIC Bridge: Down")
 	)
 	RBMonitor->RBMIntPort->value = RBPort
 	RBMonitor->RBMBolLocal->value = RBLocal
