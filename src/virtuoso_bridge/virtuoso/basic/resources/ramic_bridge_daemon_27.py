@@ -309,7 +309,7 @@ def start_server():
                 raise
 
         s.listen(1)
-        # Banner — SKILL side parses this from stderr to populate
+        # Banner -- SKILL side parses this from stderr to populate
         # RBLastPid / RBLastBind for the monitor display.  Format is
         # frozen: "[RB-banner] pid=<n> bind=<host>:<port>".
         sys.stderr.write(
