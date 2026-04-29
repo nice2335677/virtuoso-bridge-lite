@@ -145,8 +145,17 @@ def main() -> int:
         )
 
     # 2. Discover Virtuoso's working dir (cds.lib + ihdl run there).
-    r = client.execute_skill('sprintf(nil "%L" getWorkingDir())')
-    workdir = (r.output or "").strip().strip('"')
+    #    getWorkingDir() returns a SKILL string; the bridge wraps it in one
+    #    layer of double-quotes ("..."), and inside that the SKILL %L escape
+    #    can re-introduce \" if we sprintf-quote it.  Calling getWorkingDir()
+    #    directly avoids the second layer; strip() then handles the single
+    #    outer pair cleanly.
+    r = client.execute_skill('getWorkingDir()')
+    workdir = (r.output or "").strip()
+    if workdir.startswith('"') and workdir.endswith('"'):
+        workdir = workdir[1:-1]
+    # final unescape — defense in depth against any further backslash quoting
+    workdir = workdir.replace('\\"', '"').replace('\\\\', '\\')
     if not workdir:
         sys.exit("ERROR: could not determine Virtuoso working directory")
 
