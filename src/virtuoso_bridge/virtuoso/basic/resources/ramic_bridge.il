@@ -254,11 +254,19 @@ procedure(RBStopAll()
 )
 
 ; ============================================================================
-; GUI Components for the RAMIC Bridge Monitor (once per session)
+; GUI Components for the RAMIC Bridge Monitor
 ; ============================================================================
-; Re-running hiCreateAppForm / hiInsertBannerMenu on reload causes form/menu
-; conflicts; build GUI and banner menu only the first time.
-unless(boundp('RBMonInstalled)
+; Re-running hiCreateAppForm with the same ?name *does* work on this IC build
+; (it replaces the existing form), so layout edits applied via reload() take
+; effect by setting RBMonInstalled = nil before reloading.  hiInsertBannerMenu
+; isn't as friendly -- repeating it stacks the menu in the banner -- so the
+; menu portion is gated separately further below.
+;
+; Guard checks the *value* (with a boundp check on the side, so a fresh
+; SKILL session whose RBMonInstalled is unbound doesn't error on the value
+; read).  ``RBMonInstalled = nil`` on its own is enough to force a rebuild
+; on the next reload; nothing here needs SKILL's missing makunbound/unset.
+unless(boundp('RBMonInstalled) && RBMonInstalled
 progn(
 ; ----------------------------------------------------------------------
 ; Status section -- four stacked labels.  Section header sits on its
@@ -421,38 +429,41 @@ hiCreateAppForm(
 ; Menu Integration
 ; ============================================================================
 
-; Create RAMIC menu in Virtuoso's banner.  Note: menu and form are
-; built only once per session (gated by RBMonInstalled); reloading
-; ramic_bridge.il updates the procedure bodies but cannot add new
-; menu entries without restarting Virtuoso.  In the meantime the
-; functions are still callable from the CIW directly.
-ramicMenu = hiCreatePulldownMenu(
-	'ramicMenu
-	"RAMIC"
-	list(
-		hiCreateMenuItem(
-			?name 'RAMIC_Bridge
-			?itemText "RAMIC Bridge..."
-			?callback "hiDisplayForm(RBMonitor)"
-		)
-		hiCreateMenuItem(
-			?name 'RAMIC_PrintLines5
-			?itemText "Print 5 Empty Lines"
-			?callback "RBPrintEmptyLines(5)"
-		)
-		hiCreateMenuItem(
-			?name 'RAMIC_PrintLines10
-			?itemText "Print 10 Empty Lines"
-			?callback "RBPrintEmptyLines(10)"
-		)
-	)
-)
-
-; Insert the RAMIC menu into Virtuoso's main window
-hiInsertBannerMenu(window(1) ramicMenu 3)
 RBMonInstalled = t
 )
 ) ; end unless(boundp 'RBMonInstalled) + progn
+
+; ---------------------------------------------------------------------
+; Banner menu -- guarded SEPARATELY from the form because hiInsertBanner
+; Menu has no remove-and-replace primitive on this IC build.  We need
+; the form to be re-creatable (toggle RBMonInstalled = nil + reload),
+; but the menu must stay built once per Virtuoso session.
+; ---------------------------------------------------------------------
+unless(boundp('RBMenuInstalled) && RBMenuInstalled
+    ramicMenu = hiCreatePulldownMenu(
+        'ramicMenu
+        "RAMIC"
+        list(
+            hiCreateMenuItem(
+                ?name 'RAMIC_Bridge
+                ?itemText "RAMIC Bridge..."
+                ?callback "hiDisplayForm(RBMonitor)"
+            )
+            hiCreateMenuItem(
+                ?name 'RAMIC_PrintLines5
+                ?itemText "Print 5 Empty Lines"
+                ?callback "RBPrintEmptyLines(5)"
+            )
+            hiCreateMenuItem(
+                ?name 'RAMIC_PrintLines10
+                ?itemText "Print 10 Empty Lines"
+                ?callback "RBPrintEmptyLines(10)"
+            )
+        )
+    )
+    hiInsertBannerMenu(window(1) ramicMenu 3)
+    RBMenuInstalled = t
+)
 
 procedure(RBMRefresh()
     ; Re-read SKILL state and repaint the monitor form.
