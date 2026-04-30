@@ -466,14 +466,14 @@ unless(boundp('RBMenuInstalled) && RBMenuInstalled
                 ?callback "hiDisplayForm(RBMonitor)"
             )
             hiCreateMenuItem(
-                ?name 'RAMIC_PrintLines5
-                ?itemText "Print 5 Empty Lines"
-                ?callback "RBPrintEmptyLines(5)"
-            )
-            hiCreateMenuItem(
                 ?name 'RAMIC_PrintLines10
                 ?itemText "Print 10 Empty Lines"
                 ?callback "RBPrintEmptyLines(10)"
+            )
+            hiCreateMenuItem(
+                ?name 'RAMIC_PrintLines20
+                ?itemText "Print 20 Empty Lines"
+                ?callback "RBPrintEmptyLines(20)"
             )
         )
     )
