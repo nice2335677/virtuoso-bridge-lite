@@ -582,6 +582,51 @@ class SSHRunner:
             stderr_summary or "no detail",
         )
 
+    def _attempt_with_cm_fallback(
+        self,
+        run_one: "Callable[[], tuple[int, bytes, bytes]]",
+        *,
+        max_attempts: int = 3,
+    ) -> tuple[int, bytes, bytes]:
+        """Repeatedly call ``run_one`` (which builds + runs one ssh/scp/tar
+        attempt and returns ``(rc, stdout, stderr)``) until success or
+        ``max_attempts`` is exhausted.
+
+        Two failure modes drive a retry:
+          - **ControlMaster runtime failure** (e.g. ``mux_client_request_session``
+            on Windows OpenSSH or stale socket): disable CM for the session
+            via :meth:`_disable_cm_for_session` and retry; the next
+            ``run_one`` call rebuilds its ssh command and will pick up the
+            no-CM config.
+          - **Transient transport flake** ("banner exchange timeout",
+            "kex_exchange_identification"): retry without changing config.
+
+        Mirrors the loop structure of :meth:`_run_command_once`. Used by
+        upload / download / text-upload paths so they get the same
+        graceful CM degradation that ``run_command`` already had.
+        """
+        rc: int = -1
+        out: bytes = b""
+        err: bytes = b""
+        for attempt in range(max_attempts):
+            rc, out, err = run_one()
+            if rc == 0:
+                return rc, out, err
+            err_text = err.decode("utf-8", errors="replace") if isinstance(err, bytes) else str(err)
+            if self._is_cm_failure(rc, err_text):
+                stderr_first = err_text.strip().splitlines()[0] if err_text.strip() else ""
+                self._disable_cm_for_session(stderr_first)
+                continue
+            if self._is_transient_ssh_error(rc, err_text):
+                if attempt + 1 < max_attempts:
+                    logger.info(
+                        "Transient SSH error on %s (rc=%d); retrying",
+                        self._host, rc,
+                    )
+                continue
+            break
+        return rc, out, err
+
     def _run_command_once(self, command: str, timeout: int | None = None) -> CommandResult:
         effective_timeout = timeout or self._timeout
         # Pipe the command to `ssh host sh -l` via stdin so it always runs in
@@ -762,23 +807,32 @@ class SSHRunner:
                 f"mkdir -p {quoted_dir} && chmod 755 {quoted_dir} && cat > {quoted_path}"
             )
         )
-        cmd = self._build_ssh_base() + [remote_cmd]
-        if self._verbose:
-            print(f"[cmd] {' '.join(cmd)}  # upload -> {remote_path}", flush=True)
         logger.debug("Uploading text payload (%d chars) -> %s:%s", len(text), self._host, remote_path)
-        result = subprocess.run(
-            cmd,
-            input=text,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            **_windows_no_window_kwargs(),
-        )
-        if result.returncode != 0:
-            logger.warning("SSH text upload failed (rc=%d): %s", result.returncode, result.stderr.strip())
+        text_bytes = text.encode("utf-8")
+
+        def _attempt() -> tuple[int, bytes, bytes]:
+            # Rebuild ssh command per attempt so a CM-disable mid-loop
+            # picks up the no-mux config on the next try.
+            cmd = self._build_ssh_base() + [remote_cmd]
+            if self._verbose:
+                print(f"[cmd] {' '.join(cmd)}  # upload -> {remote_path}", flush=True)
+            r = subprocess.run(
+                cmd,
+                input=text_bytes,
+                capture_output=True,
+                text=False,
+                timeout=effective_timeout,
+                **_windows_no_window_kwargs(),
+            )
+            return r.returncode, r.stdout or b"", r.stderr or b""
+
+        rc, out, err = self._attempt_with_cm_fallback(_attempt)
+        if rc != 0:
+            err_text = _as_text(err).strip()
+            logger.warning("SSH text upload failed (rc=%d): %s", rc, err_text)
         else:
             logger.debug("Text upload completed successfully")
-        return CommandResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        return CommandResult(returncode=rc, stdout=_as_text(out), stderr=_as_text(err))
 
     def download(
         self,
@@ -794,22 +848,30 @@ class SSHRunner:
             return self._download_via_tar(remote_path, local_path, timeout=effective_timeout)
 
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [self._scp_cmd] + self._common_ssh_options()
-        cmd += [self._remote_scp_target(remote_path), str(local_path)]
-        self._print_cmd(cmd)
         logger.debug("Downloading via scp %s:%s -> %s", self._host, remote_path, local_path)
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=effective_timeout,
-            **_windows_no_window_kwargs(),
-        )
-        if result.returncode != 0:
-            logger.warning("download (scp) failed (rc=%d): %s", result.returncode, result.stderr.strip())
+
+        def _attempt() -> tuple[int, bytes, bytes]:
+            # Rebuild scp command per attempt so a CM-disable mid-loop
+            # picks up the no-mux config on the next try.
+            cmd = [self._scp_cmd] + self._common_ssh_options()
+            cmd += [self._remote_scp_target(remote_path), str(local_path)]
+            self._print_cmd(cmd)
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,         # bytes for the helper
+                timeout=effective_timeout,
+                **_windows_no_window_kwargs(),
+            )
+            return r.returncode, r.stdout or b"", r.stderr or b""
+
+        rc, out, err = self._attempt_with_cm_fallback(_attempt)
+        if rc != 0:
+            err_text = _as_text(err).strip()
+            logger.warning("download (scp) failed (rc=%d): %s", rc, err_text)
         else:
             logger.debug("Download completed successfully")
-        return CommandResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        return CommandResult(returncode=rc, stdout=_as_text(out), stderr=_as_text(err))
 
     def _download_via_tar(
         self,
@@ -890,37 +952,49 @@ class SSHRunner:
         remote_dir = str(Path(remote_path).parent).replace("\\", "/")
         remote_dir_q = shlex.quote(remote_dir)
         remote_cmd = f"mkdir -p {remote_dir_q} && tar xf - -C {remote_dir_q}"
-        ssh_cmd = self._build_ssh_base() + [remote_cmd]
-        tar_cmd = [self._tar_cmd, "cf", "-", "-C", str(local_path.parent).replace("\\", "/"), local_path.name]
-        if self._verbose:
-            print(f"[cmd] {' '.join(tar_cmd)} | {' '.join(ssh_cmd)}  # upload {local_path} -> {remote_path}", flush=True)
+        tar_cmd = [self._tar_cmd, "cf", "-", "-C",
+                   str(local_path.parent).replace("\\", "/"), local_path.name]
         logger.debug("Uploading via tar pipe %s -> %s:%s", local_path, self._host, remote_path)
-        tar_proc = subprocess.Popen(
-            tar_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **_windows_no_window_kwargs(),
-        )
-        ssh_proc = subprocess.Popen(
-            ssh_cmd,
-            stdin=tar_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **_windows_no_window_kwargs(),
-        )
-        if tar_proc.stdout:
-            tar_proc.stdout.close()
-        try:
-            ssh_out, ssh_err = ssh_proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            ssh_proc.kill()
-            tar_proc.kill()
-            raise
-        tar_proc.wait()
+
+        def _attempt() -> tuple[int, bytes, bytes]:
+            # Rebuild ssh command per attempt so a CM-disable mid-loop
+            # picks up the no-mux config on the next try.
+            ssh_cmd = self._build_ssh_base() + [remote_cmd]
+            if self._verbose:
+                print(
+                    f"[cmd] {' '.join(tar_cmd)} | {' '.join(ssh_cmd)}"
+                    f"  # upload {local_path} -> {remote_path}",
+                    flush=True,
+                )
+            tar_proc = subprocess.Popen(
+                tar_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **_windows_no_window_kwargs(),
+            )
+            ssh_proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=tar_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **_windows_no_window_kwargs(),
+            )
+            if tar_proc.stdout:
+                tar_proc.stdout.close()
+            try:
+                ssh_out, ssh_err = ssh_proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                ssh_proc.kill()
+                tar_proc.kill()
+                raise
+            tar_proc.wait()
+            return ssh_proc.returncode, ssh_out or b"", ssh_err or b""
+
+        rc, out, err = self._attempt_with_cm_fallback(_attempt)
         return CommandResult(
-            returncode=ssh_proc.returncode,
-            stdout=_as_text(ssh_out),
-            stderr=_as_text(ssh_err),
+            returncode=rc,
+            stdout=_as_text(out),
+            stderr=_as_text(err),
         )
 
     def ensure_persistent_shell(self, timeout: int | None = None) -> None:
